@@ -1,8 +1,14 @@
 # app.py
 import io
+from pathlib import Path
+
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+from trade_sizing import pnl_series, rolling_vol, spread_returns_bps
+from carry_rolldown import leg_carry_roll
 
 # -----------------------------
 # Page config
@@ -104,6 +110,89 @@ def spread_vol(spread: pd.Series, window: int, diff_first: bool, annualize: bool
     return float(vol)
 
 
+def render_line_chart(
+    data: pd.Series | pd.DataFrame,
+    *,
+    height: int = 260,
+    y_label: str | None = None,
+    title: str | None = None,
+    upper_threshold: float | None = None,
+    lower_threshold: float | None = None,
+    upper_color: str = "#2ca02c",
+    lower_color: str = "#d62728",
+    default_color: str = "#1f77b4",
+) -> None:
+    """Render a line chart sized to the data using Altair."""
+
+    if data is None:
+        return
+
+    if isinstance(data, pd.Series):
+        series = data.dropna()
+        if series.empty:
+            return
+        value_col = series.name or "value"
+        if not isinstance(value_col, str):
+            value_col = str(value_col)
+        df = series.reset_index()
+        df.columns = [df.columns[0], value_col]
+    else:
+        df = data.dropna(how="any")
+        if df.empty:
+            return
+        df = df.reset_index()
+        trailing_cols = [c for c in df.columns[1:] if c not in ("level_0", "level_1")]
+        value_col = (trailing_cols[-1] if trailing_cols else df.columns[-1]) or "value"
+        if not isinstance(value_col, str):
+            value_col = str(value_col)
+        df = df.rename(columns={df.columns[-1]: value_col})
+
+    x_col = df.columns[0]
+    if not pd.api.types.is_datetime64_any_dtype(df[x_col]):
+        df[x_col] = pd.to_datetime(df[x_col], errors="coerce")
+        df = df.dropna(subset=[x_col])
+        if df.empty:
+            return
+
+    encoding = {
+        "x": alt.X(f"{x_col}:T", title="Date"),
+        "y": alt.Y(
+            f"{value_col}:Q",
+            title=y_label or value_col,
+            scale=alt.Scale(zero=False),
+        ),
+    }
+
+    layers = [
+        alt.Chart(df).mark_line(color=default_color).encode(**encoding)
+    ]
+
+    if upper_threshold is not None:
+        df_upper = df[[x_col, value_col]].copy()
+        df_upper.loc[df_upper[value_col] <= upper_threshold, value_col] = np.nan
+        layers.append(
+            alt.Chart(df_upper)
+            .mark_line(color=upper_color)
+            .encode(**encoding)
+        )
+
+    if lower_threshold is not None:
+        df_lower = df[[x_col, value_col]].copy()
+        df_lower.loc[df_lower[value_col] >= lower_threshold, value_col] = np.nan
+        layers.append(
+            alt.Chart(df_lower)
+            .mark_line(color=lower_color)
+            .encode(**encoding)
+        )
+
+    chart = alt.layer(*layers).properties(height=height)
+
+    if title:
+        chart = chart.properties(title=title)
+
+    st.altair_chart(chart, use_container_width=True)
+
+
 # -----------------------------
 # Sidebar (file selection boxes)
 # -----------------------------
@@ -123,6 +212,76 @@ with st.sidebar:
     diff_first = st.checkbox("Use daily Δ for vol (recommended)", value=True)
     annualize = st.checkbox("Annualize vol (×√252)", value=False)
 
+    st.markdown("**Leg Inputs**")
+    col_leg1, col_leg2 = st.columns(2, gap="small")
+    with col_leg1:
+        dv01_leg1 = st.number_input(
+            "DV01 Leg 1 (EUR/bp)",
+            min_value=0.0,
+            value=8.0,
+            step=0.5,
+            format="%0.2f",
+        )
+        coupon_leg1 = st.number_input(
+            "Coupon Leg 1 (%)",
+            value=3.0,
+            step=0.1,
+            format="%0.2f",
+        )
+        repo_leg1 = st.number_input(
+            "Repo Rate Leg 1 (%)",
+            value=2.0,
+            step=0.1,
+            format="%0.2f",
+        )
+        roll_down_leg1 = st.number_input(
+            "Roll Down Leg 1 (bp)",
+            value=10.0,
+            step=1.0,
+            format="%0.1f",
+        )
+        price_leg1 = st.number_input(
+            "Gross Price Leg 1",
+            min_value=0.0,
+            value=100.0,
+            step=0.1,
+            format="%0.2f",
+        )
+    with col_leg2:
+        dv01_leg2 = st.number_input(
+            "DV01 Leg 2 (EUR/bp)",
+            min_value=0.0,
+            value=8.0,
+            step=0.5,
+            format="%0.2f",
+        )
+        coupon_leg2 = st.number_input(
+            "Coupon Leg 2 (%)",
+            value=3.0,
+            step=0.1,
+            format="%0.2f",
+        )
+        repo_leg2 = st.number_input(
+            "Repo Rate Leg 2 (%)",
+            value=2.0,
+            step=0.1,
+            format="%0.2f",
+        )
+        roll_down_leg2 = st.number_input(
+            "Roll Down Leg 2 (bp)",
+            value=10.0,
+            step=1.0,
+            format="%0.1f",
+        )
+        price_leg2 = st.number_input(
+            "Gross Price Leg 2",
+            min_value=0.0,
+            value=100.0,
+            step=0.1,
+            format="%0.2f",
+        )
+    target_daily_vol = st.number_input("Trade daily vol target (EUR)", min_value=0.0, value=5000.0, step=100.0)
+
 # -----------------------------
 # Load data
 # -----------------------------
@@ -130,12 +289,35 @@ if "df1" not in st.session_state:
     st.session_state.df1 = None
 if "df2" not in st.session_state:
     st.session_state.df2 = None
+if "file1_name" not in st.session_state:
+    st.session_state.file1_name = None
+if "file2_name" not in st.session_state:
+    st.session_state.file2_name = None
+if "defaults_loaded" not in st.session_state:
+    st.session_state.defaults_loaded = False
+
+if not st.session_state.defaults_loaded:
+    base_dir = Path(__file__).resolve().parent
+    default_map = {
+        "df1": "BTPS10Y.csv",
+        "df2": "FRTR10Y.csv",
+    }
+    for key, filename in default_map.items():
+        csv_path = base_dir / filename
+        if csv_path.exists():
+            with csv_path.open("rb") as fh:
+                buffer = io.BytesIO(fh.read())
+            st.session_state[key] = read_timeseries_csv(buffer)
+            st.session_state[f"{key.replace('df', 'file')}_name"] = Path(filename).stem
+    st.session_state.defaults_loaded = True
 
 if load1 and file1 is not None:
     st.session_state.df1 = read_timeseries_csv(file1)
+    st.session_state.file1_name = Path(file1.name).stem
 
 if load2 and file2 is not None:
     st.session_state.df2 = read_timeseries_csv(file2)
+    st.session_state.file2_name = Path(file2.name).stem
 
 df1 = st.session_state.df1
 df2 = st.session_state.df2
@@ -146,7 +328,8 @@ df2 = st.session_state.df2
 col_top_l, col_top_r = st.columns(2, gap="large")
 
 with col_top_l:
-    st.subheader("Chart 1 (Time Series)")
+    chart1_title = st.session_state.file1_name or "Chart 1 (Time Series)"
+    st.subheader(chart1_title)
     if df1 is None:
         st.info("Upload 1 and click LOAD 1 to display Chart 1.")
         s1 = None
@@ -154,10 +337,11 @@ with col_top_l:
     else:
         s1, c1 = ensure_single_series(df1, "Upload 1")
         if s1 is not None and not s1.empty:
-            st.line_chart(s1, height=260)
+            render_line_chart(s1, height=260, y_label=c1)
 
 with col_top_r:
-    st.subheader("Chart 2")
+    chart2_title = st.session_state.file2_name or "Chart 2"
+    st.subheader(chart2_title)
     if df2 is None:
         st.info("Upload 2 and click LOAD 2 to display Chart 2.")
         s2 = None
@@ -165,16 +349,17 @@ with col_top_r:
     else:
         s2, c2 = ensure_single_series(df2, "Upload 2")
         if s2 is not None and not s2.empty:
-            st.line_chart(s2, height=260)
+            render_line_chart(s2, height=260, y_label=c2)
 
 st.markdown("---")
 
 col_mid_l, col_mid_r = st.columns(2, gap="large")
 
 with col_mid_l:
-    st.subheader("Spread (1) − (2)")
+    st.subheader("Spread Time Serie")
     spread = None
     merged = None
+    spread_returns = None
     if s1 is None or s2 is None:
         st.info("Load both series above to compute the spread.")
     else:
@@ -184,16 +369,28 @@ with col_mid_l:
         else:
             spread = merged["series1"] - merged["series2"]
             spread.name = f"{c1 or 'series1'} - {c2 or 'series2'}"
-            st.line_chart(spread, height=260)
+            render_line_chart(spread, height=260, y_label=spread.name)
+
+            spread_returns = spread_returns_bps(spread)
+            returns_for_vol = spread_returns.dropna()
+            vol_series = returns_for_vol.rolling(int(roll_vol)).std(ddof=1)
+            vol_series.name = "Rolling Spread Vol (bp)"
+            render_line_chart(vol_series, height=260, y_label="Rolling Spread Vol (bp)")
 
 with col_mid_r:
-    st.subheader("Z-Score ( (1) − (2) )")
+    st.subheader("Rolling Z-Score Time Serie")
     if spread is None or spread.empty:
         st.info("Spread required to compute Z-Score.")
         z = None
     else:
         z = rolling_zscore(spread, int(roll_spread))
-        st.line_chart(z, height=260)
+        render_line_chart(
+            z,
+            height=260,
+            y_label="Z-Score",
+            upper_threshold=2.0,
+            lower_threshold=-2.0,
+        )
 
 st.markdown("---")
 
@@ -204,7 +401,7 @@ if merged is None or merged.empty:
 else:
     corr = merged["series1"].rolling(int(roll_corr)).corr(merged["series2"])
     corr_df = corr.to_frame(name="correlation")
-    st.line_chart(corr_df, height=260)
+    render_line_chart(corr_df["correlation"], height=260, y_label="Correlation")
 
 st.markdown("---")
 
@@ -230,6 +427,207 @@ with kpi_r:
     else:
         latest_z = float(z.dropna().iloc[-1])
         st.metric(label="Latest Z", value=f"{latest_z:,.3f}")
+
+st.markdown("---")
+
+st.subheader("Trade Sizing")
+if spread is None or spread.empty:
+    st.info("Compute the spread above to enable trade sizing.")
+    returns_bps = pd.Series(dtype="float64")
+    pnl = pd.Series(dtype="float64")
+    spread_vol_bp = float("nan")
+    pnl_combined_vol = float("nan")
+    leg1_vol_cents = float("nan")
+    leg2_vol_cents = float("nan")
+    leg1_window_vol_cents = float("nan")
+    notional_leg1 = float("nan")
+    notional_leg2 = float("nan")
+    scaling = float("nan")
+    ratio = float("nan")
+    leg1_carry_cents = float("nan")
+    leg2_carry_cents = float("nan")
+    trade_carry_cents = float("nan")
+    carry_ratio_pct = float("nan")
+else:
+    returns_leg1 = spread_returns_bps(s1) if s1 is not None else pd.Series(dtype="float64")
+    returns_leg2 = spread_returns_bps(s2) if s2 is not None else pd.Series(dtype="float64")
+    returns_df = pd.concat(
+        {
+            "spread": spread_returns if spread_returns is not None else pd.Series(dtype="float64"),
+            "leg1": returns_leg1,
+            "leg2": returns_leg2,
+        },
+        axis=1,
+    ).dropna()
+
+    ratio = (dv01_leg1 / dv01_leg2) if dv01_leg2 > 0 else float("nan")
+
+    if returns_df.empty or returns_df.shape[0] < int(roll_vol):
+        st.warning("Not enough overlapping data to compute trade sizing metrics.")
+        returns_bps = pd.Series(dtype="float64")
+        pnl = pd.Series(dtype="float64")
+        spread_vol_bp = float("nan")
+        pnl_combined_vol = float("nan")
+        leg1_vol_cents = float("nan")
+        leg2_vol_cents = float("nan")
+        leg1_window_vol_cents = float("nan")
+        notional_leg1 = float("nan")
+        notional_leg2 = float("nan")
+        scaling = float("nan")
+        leg1_carry_cents = float("nan")
+        leg2_carry_cents = float("nan")
+        trade_carry_cents = float("nan")
+        carry_ratio_pct = float("nan")
+    else:
+        returns_bps = returns_df["spread"]
+        returns_leg1 = returns_df["leg1"]
+        returns_leg2 = returns_df["leg2"]
+
+        pnl_leg1_unit = pnl_series(returns_leg1, dv01_leg1)
+        pnl_leg2_unit = pnl_series(returns_leg2, dv01_leg2)
+
+        pnl = pnl_leg1_unit - (pnl_leg2_unit * ratio)
+        pnl.name = "Daily P&L (cents)"
+
+        spread_vol_bp = rolling_vol(returns_bps, int(roll_vol))
+        pnl_combined_vol = rolling_vol(pnl, int(roll_vol))
+
+        if (
+            np.isnan(pnl_combined_vol)
+            or pnl_combined_vol <= 0
+            or target_daily_vol <= 0
+            or np.isnan(ratio)
+            or ratio <= 0
+        ):
+            scaling = float("nan")
+            notional_leg1 = float("nan")
+            notional_leg2 = float("nan")
+        else:
+            scaling = target_daily_vol / pnl_combined_vol
+            notional_leg1 = scaling * 10_000.0
+            notional_leg2 = notional_leg1 * ratio
+
+        if np.isnan(spread_vol_bp):
+            leg1_vol_cents = float("nan")
+            leg2_vol_cents = float("nan")
+            leg1_window_vol_cents = float("nan")
+        else:
+            leg1_vol_cents = spread_vol_bp * dv01_leg1
+            leg2_vol_cents = spread_vol_bp * dv01_leg2
+            leg1_window_vol_cents = leg1_vol_cents * np.sqrt(float(roll_vol))
+
+        leg1_carry = leg_carry_roll(
+            coupon_pct=coupon_leg1,
+            repo_pct=repo_leg1,
+            roll_down_bps=roll_down_leg1,
+            gross_price=price_leg1,
+            dv01_eur_bp=dv01_leg1,
+            window_days=int(roll_vol),
+        )
+        leg2_carry = leg_carry_roll(
+            coupon_pct=coupon_leg2,
+            repo_pct=repo_leg2,
+            roll_down_bps=roll_down_leg2,
+            gross_price=price_leg2,
+            dv01_eur_bp=dv01_leg2,
+            window_days=int(roll_vol),
+        )
+
+        leg1_carry_cents = leg1_carry.total_cents
+        leg2_carry_cents = leg2_carry.total_cents
+        trade_carry_cents = (
+            leg1_carry_cents - leg2_carry_cents * ratio if not np.isnan(ratio) else float("nan")
+        )
+        if (
+            np.isnan(trade_carry_cents)
+            or np.isnan(leg1_window_vol_cents)
+            or leg1_window_vol_cents == 0
+        ):
+            carry_ratio_pct = float("nan")
+        else:
+            carry_ratio_pct = (trade_carry_cents * 100.0) / leg1_window_vol_cents
+
+    chart_cols = st.columns(2, gap="large")
+    with chart_cols[0]:
+        st.write("Spread Δ (bp)")
+        if returns_bps.empty:
+            st.info("Not enough data to compute spread changes.")
+        else:
+            render_line_chart(returns_bps, height=240, y_label="Δ Spread (bp)")
+    with chart_cols[1]:
+        st.write("Daily P&L (cents)")
+        if pnl.empty:
+            st.info("Enter DV01s above to compute P&L.")
+        else:
+            render_line_chart(pnl, height=240, y_label="Daily P&L (cents)")
+
+    metrics_top = st.columns(2, gap="large")
+    with metrics_top[0]:
+        if np.isnan(spread_vol_bp):
+            st.metric("Daily Spread Vol (bp)", "n/a")
+        else:
+            st.metric("Daily Spread Vol (bp)", f"{spread_vol_bp:,.2f}")
+    with metrics_top[1]:
+        if np.isnan(pnl_combined_vol):
+            st.metric("Trade Daily P&L Vol (EUR)", "n/a")
+        else:
+            scaled_trade_vol = (
+                pnl_combined_vol * scaling if not np.isnan(scaling) else pnl_combined_vol
+            )
+            st.metric("Trade Daily P&L Vol (EUR)", f"{scaled_trade_vol:,.0f}")
+
+    leg_metric_cols = st.columns(6, gap="large")
+    with leg_metric_cols[0]:
+        st.metric("Leg 1 DV01 (EUR/bp)", f"{dv01_leg1:,.2f}")
+    with leg_metric_cols[1]:
+        if np.isnan(leg1_vol_cents):
+            st.metric("Leg 1 Daily P&L Vol (cents)", "n/a")
+        else:
+            st.metric("Leg 1 Daily P&L Vol (cents)", f"{leg1_vol_cents:,.2f}")
+    with leg_metric_cols[2]:
+        if np.isnan(notional_leg1):
+            st.metric("Leg 1 Notional Needed (EUR)", "n/a")
+        else:
+            st.metric("Leg 1 Notional Needed (EUR)", f"{abs(notional_leg1):,.0f}")
+    with leg_metric_cols[3]:
+        st.metric("Leg 2 DV01 (EUR/bp)", f"{dv01_leg2:,.2f}")
+    with leg_metric_cols[4]:
+        if np.isnan(leg2_vol_cents):
+            st.metric("Leg 2 Daily P&L Vol (cents)", "n/a")
+        else:
+            st.metric("Leg 2 Daily P&L Vol (cents)", f"{abs(leg2_vol_cents):,.2f}")
+    with leg_metric_cols[5]:
+        if np.isnan(notional_leg2):
+            st.metric("Leg 2 Notional Needed (EUR)", "n/a")
+        else:
+            st.metric("Leg 2 Notional Needed (EUR)", f"{abs(notional_leg2):,.0f}")
+
+    carry_cols = st.columns(5, gap="large")
+    with carry_cols[0]:
+        if np.isnan(leg1_carry_cents):
+            st.metric("Leg 1 Carry+Roll (cents)", "n/a")
+        else:
+            st.metric("Leg 1 Carry+Roll (cents)", f"{leg1_carry_cents:,.2f}")
+    with carry_cols[1]:
+        if np.isnan(leg2_carry_cents):
+            st.metric("Leg 2 Carry+Roll (cents)", "n/a")
+        else:
+            st.metric("Leg 2 Carry+Roll (cents)", f"{leg2_carry_cents:,.2f}")
+    with carry_cols[2]:
+        if np.isnan(trade_carry_cents):
+            st.metric("Trade Carry+Roll (cents)", "n/a")
+        else:
+            st.metric("Trade Carry+Roll (cents)", f"{trade_carry_cents:,.2f}")
+    with carry_cols[3]:
+        if np.isnan(leg1_window_vol_cents):
+            st.metric("Leg 1 Window Vol (cents)", "n/a")
+        else:
+            st.metric("Leg 1 Window Vol (cents)", f"{leg1_window_vol_cents:,.2f}")
+    with carry_cols[4]:
+        if np.isnan(carry_ratio_pct):
+            st.metric("Carry / Vol Ratio (%)", "n/a")
+        else:
+            st.metric("Carry / Vol Ratio (%)", f"{carry_ratio_pct:,.2f}%")
 
 # Optional downloads
 st.markdown("---")
@@ -257,10 +655,13 @@ with dl_cols[2]:
             out["zscore"] = z
         if "corr" in locals() and corr is not None:
             out["correlation"] = corr
+        if "pnl" in locals() and pnl is not None:
+            out["spread_return_bp"] = returns_bps
+            out["pnl_eur"] = pnl
         st.download_button(
-            "Download Spread, Z & Corr (CSV)",
+            "Download Spread Analytics (CSV)",
             out.to_csv().encode("utf-8"),
-            file_name="spread_z_corr.csv",
+            file_name="spread_analytics.csv",
             mime="text/csv",
         )
 
