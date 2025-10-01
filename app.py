@@ -121,6 +121,7 @@ def render_line_chart(
     upper_color: str = "#2ca02c",
     lower_color: str = "#d62728",
     default_color: str = "#1f77b4",
+    dropna: bool = True,
 ) -> None:
     """Render a line chart sized to the data using Altair."""
 
@@ -128,7 +129,7 @@ def render_line_chart(
         return
 
     if isinstance(data, pd.Series):
-        series = data.dropna()
+        series = data.dropna() if dropna else data.copy()
         if series.empty:
             return
         value_col = series.name or "value"
@@ -137,7 +138,7 @@ def render_line_chart(
         df = series.reset_index()
         df.columns = [df.columns[0], value_col]
     else:
-        df = data.dropna(how="any")
+        df = data.dropna(how="any") if dropna else data.copy()
         if df.empty:
             return
         df = df.reset_index()
@@ -224,13 +225,13 @@ with st.sidebar:
         )
         coupon_leg1 = st.number_input(
             "Coupon Leg 1 (%)",
-            value=3.0,
+            value=4.0,
             step=0.1,
             format="%0.2f",
         )
         repo_leg1 = st.number_input(
             "Repo Rate Leg 1 (%)",
-            value=2.0,
+            value=2.1,
             step=0.1,
             format="%0.2f",
         )
@@ -243,7 +244,7 @@ with st.sidebar:
         price_leg1 = st.number_input(
             "Gross Price Leg 1",
             min_value=0.0,
-            value=100.0,
+            value=104.0,
             step=0.1,
             format="%0.2f",
         )
@@ -257,7 +258,7 @@ with st.sidebar:
         )
         coupon_leg2 = st.number_input(
             "Coupon Leg 2 (%)",
-            value=3.0,
+            value=3.5,
             step=0.1,
             format="%0.2f",
         )
@@ -280,7 +281,7 @@ with st.sidebar:
             step=0.1,
             format="%0.2f",
         )
-    target_daily_vol = st.number_input("Trade daily vol target (EUR)", min_value=0.0, value=5000.0, step=100.0)
+    target_daily_vol = st.number_input("Trade daily vol target (EUR)", min_value=0.0, value=20000.0, step=100.0)
 
 # -----------------------------
 # Load data
@@ -353,46 +354,50 @@ with col_top_r:
 
 st.markdown("---")
 
-col_mid_l, col_mid_r = st.columns(2, gap="large")
-
-with col_mid_l:
-    st.subheader("Spread Time Serie")
-    spread = None
-    merged = None
-    spread_returns = None
-    if s1 is None or s2 is None:
-        st.info("Load both series above to compute the spread.")
+st.subheader("Spread Time Serie")
+spread = None
+merged = None
+spread_returns = None
+timeline_index = None
+if s1 is None or s2 is None:
+    st.info("Load both series above to compute the spread.")
+else:
+    timeline_index = s1.index.union(s2.index).sort_values()
+    merged = align_two(s1, s2, how="inner")
+    if merged.empty:
+        st.warning("No overlapping dates between the two series.")
     else:
-        merged = align_two(s1, s2, how="inner")
-        if merged.empty:
-            st.warning("No overlapping dates between the two series.")
-        else:
-            spread = merged["series1"] - merged["series2"]
-            spread.name = f"{c1 or 'series1'} - {c2 or 'series2'}"
-            render_line_chart(spread, height=260, y_label=spread.name)
+        spread = merged["series1"] - merged["series2"]
+        spread.name = f"{c1 or 'series1'} - {c2 or 'series2'}"
+        spread_chart = spread.reindex(timeline_index) if timeline_index is not None else spread
+        render_line_chart(spread_chart, height=260, y_label=spread.name)
 
-            spread_returns = spread_returns_bps(spread)
-            returns_for_vol = spread_returns.dropna()
-            vol_series = returns_for_vol.rolling(int(roll_vol)).std(ddof=1)
-            vol_series.name = "Rolling Spread Vol (bp)"
-            render_line_chart(vol_series, height=260, y_label="Rolling Spread Vol (bp)")
+st.subheader("Rolling Z-Score Time Serie")
+if spread is None or spread.empty:
+    st.info("Spread required to compute Z-Score.")
+    z = None
+else:
+    z = rolling_zscore(spread, int(roll_spread))
+    z_chart = z.reindex(timeline_index) if timeline_index is not None else z
+    render_line_chart(
+        z_chart,
+        height=260,
+        y_label="Z-Score",
+        upper_threshold=2.0,
+        lower_threshold=-2.0,
+        dropna=False,
+    )
 
-with col_mid_r:
-    st.subheader("Rolling Z-Score Time Serie")
-    if spread is None or spread.empty:
-        st.info("Spread required to compute Z-Score.")
-        z = None
-    else:
-        z = rolling_zscore(spread, int(roll_spread))
-        render_line_chart(
-            z,
-            height=260,
-            y_label="Z-Score",
-            upper_threshold=2.0,
-            lower_threshold=-2.0,
-        )
-
-st.markdown("---")
+st.subheader("Rolling Spread Vol")
+if spread is None or spread.empty:
+    st.info("Spread required to compute rolling spread volatility.")
+else:
+    spread_returns = spread_returns_bps(spread)
+    returns_for_vol = spread_returns.dropna()
+    vol_series = returns_for_vol.rolling(int(roll_vol)).std(ddof=1)
+    vol_series.name = "Rolling Spread Vol (bp)"
+    vol_chart = vol_series.reindex(timeline_index) if timeline_index is not None else vol_series
+    render_line_chart(vol_chart, height=260, y_label="Rolling Spread Vol (bp)", dropna=False)
 
 st.subheader("Rolling Correlation")
 if merged is None or merged.empty:
@@ -401,7 +406,10 @@ if merged is None or merged.empty:
 else:
     corr = merged["series1"].rolling(int(roll_corr)).corr(merged["series2"])
     corr_df = corr.to_frame(name="correlation")
-    render_line_chart(corr_df["correlation"], height=260, y_label="Correlation")
+    corr_chart = (
+        corr_df["correlation"].reindex(timeline_index) if timeline_index is not None else corr_df["correlation"]
+    )
+    render_line_chart(corr_chart, height=260, y_label="Correlation", dropna=False)
 
 st.markdown("---")
 
@@ -603,6 +611,9 @@ else:
             st.metric("Leg 2 Notional Needed (EUR)", f"{abs(notional_leg2):,.0f}")
 
     carry_cols = st.columns(5, gap="large")
+    st.markdown(
+        f"Carry Roll Down Analysis over the following window (days): **{int(roll_vol)}**"
+    )
     with carry_cols[0]:
         if np.isnan(leg1_carry_cents):
             st.metric("Leg 1 Carry+Roll (cents)", "n/a")
