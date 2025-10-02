@@ -6,6 +6,7 @@ import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+from pandas.tseries.offsets import BDay, DateOffset
 
 from trade_sizing import pnl_series, rolling_vol, spread_returns_bps
 from carry_rolldown import leg_carry_roll
@@ -194,6 +195,107 @@ def render_line_chart(
     st.altair_chart(chart, use_container_width=True)
 
 
+def last_valid_value(series: pd.Series | None) -> float:
+    if series is None:
+        return float("nan")
+    ser = series.dropna()
+    if ser.empty:
+        return float("nan")
+    return float(ser.iloc[-1])
+
+
+def normalize_yield(value: float | None) -> float:
+    if value is None or pd.isna(value):
+        return float("nan")
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if np.isnan(val):
+        return float("nan")
+    if abs(val) > 1.0:
+        return val / 100.0
+    return val
+
+
+def format_compact(value: float | None, *, decimals: int = 2, unit: str = "") -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "n/a"
+    sign = "-" if value < 0 else ""
+    abs_val = abs(float(value))
+    for threshold, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs_val >= threshold:
+            scaled = abs_val / threshold
+            return f"{sign}{unit}{scaled:.{decimals}f}{suffix}"
+    return f"{sign}{unit}{abs_val:,.{decimals}f}"
+
+
+def compute_duration_metrics(
+    *,
+    yield_rate: float,
+    coupon_pct: float,
+    price: float,
+    frequency: int,
+    settlement: pd.Timestamp,
+    maturity: pd.Timestamp,
+    day_count: float = 365.25,
+) -> tuple[float, float, float]:
+    if (
+        pd.isna(yield_rate)
+        or pd.isna(coupon_pct)
+        or pd.isna(price)
+        or frequency <= 0
+        or price <= 0
+    ):
+        return float("nan"), float("nan"), float("nan")
+
+    settlement = pd.Timestamp(settlement)
+    maturity = pd.Timestamp(maturity)
+    if settlement >= maturity:
+        return float("nan"), float("nan"), float("nan")
+
+    coupon_rate = float(coupon_pct) / 100.0
+    freq = int(frequency)
+    y = float(yield_rate)
+
+    step_months = 12 // freq
+    if step_months <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    coupon_dates: list[pd.Timestamp] = []
+    current = maturity
+    while current > settlement:
+        coupon_dates.append(current)
+        current -= DateOffset(months=step_months)
+
+    if not coupon_dates:
+        return float("nan"), float("nan"), float("nan")
+
+    coupon_dates.sort()
+    times = np.array([(date - settlement).days / day_count for date in coupon_dates], dtype=float)
+    if times.size == 0:
+        return float("nan"), float("nan"), float("nan")
+
+    if (1 + y / freq) <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    coupon_payment = coupon_rate / freq * 100.0
+    cashflows = np.full(times.shape, coupon_payment)
+    cashflows[-1] += 100.0
+
+    discounts = (1 + y / freq) ** (freq * times)
+    pv = cashflows / discounts
+    pv_sum = pv.sum()
+    if pv_sum <= 0:
+        return float("nan"), float("nan"), float("nan")
+
+    macaulay = float((times * pv).sum() / pv_sum)
+    modified = macaulay / (1 + y / freq)
+    dv01_cents = modified * price * 0.0001 * 100.0
+
+    return macaulay, modified, dv01_cents
+
+
 # -----------------------------
 # Sidebar (file selection boxes)
 # -----------------------------
@@ -213,16 +315,23 @@ with st.sidebar:
     diff_first = st.checkbox("Use daily Δ for vol (recommended)", value=True)
     annualize = st.checkbox("Annualize vol (×√252)", value=False)
 
+    today = pd.Timestamp.today().normalize()
+    default_settlement_ts = today + BDay(2)
+    default_maturity_ts = default_settlement_ts + DateOffset(years=10)
+
+    settlement_date = st.date_input(
+        "Settlement Date",
+        value=default_settlement_ts.date(),
+    )
+    coupon_frequency = st.selectbox(
+        "Coupon Frequency",
+        ["Annual", "Semi-Annual"],
+        index=0,
+    )
+
     st.markdown("**Leg Inputs**")
     col_leg1, col_leg2 = st.columns(2, gap="small")
     with col_leg1:
-        dv01_leg1 = st.number_input(
-            "DV01 Leg 1 (EUR/bp)",
-            min_value=0.0,
-            value=8.0,
-            step=0.5,
-            format="%0.2f",
-        )
         coupon_leg1 = st.number_input(
             "Coupon Leg 1 (%)",
             value=4.0,
@@ -248,14 +357,11 @@ with st.sidebar:
             step=0.1,
             format="%0.2f",
         )
-    with col_leg2:
-        dv01_leg2 = st.number_input(
-            "DV01 Leg 2 (EUR/bp)",
-            min_value=0.0,
-            value=8.0,
-            step=0.5,
-            format="%0.2f",
+        maturity_leg1 = st.date_input(
+            "Maturity Leg 1",
+            value=default_maturity_ts.date(),
         )
+    with col_leg2:
         coupon_leg2 = st.number_input(
             "Coupon Leg 2 (%)",
             value=3.5,
@@ -280,6 +386,10 @@ with st.sidebar:
             value=100.0,
             step=0.1,
             format="%0.2f",
+        )
+        maturity_leg2 = st.date_input(
+            "Maturity Leg 2",
+            value=default_maturity_ts.date(),
         )
     target_daily_vol = st.number_input("Trade daily vol target (EUR)", min_value=0.0, value=20000.0, step=100.0)
 
@@ -411,6 +521,55 @@ else:
     )
     render_line_chart(corr_chart, height=260, y_label="Correlation", dropna=False)
 
+freq_value = 1 if coupon_frequency == "Annual" else 2
+settlement_ts = pd.Timestamp(settlement_date)
+
+yield_leg1 = normalize_yield(last_valid_value(s1))
+yield_leg2 = normalize_yield(last_valid_value(s2))
+
+macaulay_leg1, modified_leg1, dv01_leg1_cents = compute_duration_metrics(
+    yield_rate=yield_leg1,
+    coupon_pct=coupon_leg1,
+    price=price_leg1,
+    frequency=freq_value,
+    settlement=settlement_ts,
+    maturity=pd.Timestamp(maturity_leg1),
+)
+
+macaulay_leg2, modified_leg2, dv01_leg2_cents = compute_duration_metrics(
+    yield_rate=yield_leg2,
+    coupon_pct=coupon_leg2,
+    price=price_leg2,
+    frequency=freq_value,
+    settlement=settlement_ts,
+    maturity=pd.Timestamp(maturity_leg2),
+)
+
+dv01_leg1 = dv01_leg1_cents / 100.0 if not pd.isna(dv01_leg1_cents) else float("nan")
+dv01_leg2 = dv01_leg2_cents / 100.0 if not pd.isna(dv01_leg2_cents) else float("nan")
+
+duration_summary = {
+    "Leg 1": {
+        "yield_pct": yield_leg1 * 100.0 if not pd.isna(yield_leg1) else float("nan"),
+        "macaulay": macaulay_leg1,
+        "modified": modified_leg1,
+        "dv01_cents": dv01_leg1_cents,
+    },
+    "Leg 2": {
+        "yield_pct": yield_leg2 * 100.0 if not pd.isna(yield_leg2) else float("nan"),
+        "macaulay": macaulay_leg2,
+        "modified": modified_leg2,
+        "dv01_cents": dv01_leg2_cents,
+    },
+}
+
+with st.sidebar:
+    st.markdown("**Computed DV01s (cents/bp)**")
+    dv01_leg1_display = "n/a" if np.isnan(dv01_leg1_cents) else f"{dv01_leg1_cents:,.2f}"
+    dv01_leg2_display = "n/a" if np.isnan(dv01_leg2_cents) else f"{dv01_leg2_cents:,.2f}"
+    st.markdown(f"{st.session_state.file1_name or 'Leg 1'}: {dv01_leg1_display}")
+    st.markdown(f"{st.session_state.file2_name or 'Leg 2'}: {dv01_leg2_display}")
+
 st.markdown("---")
 
 # Bottom KPIs (Spread Vol & Spread Z-Score)
@@ -508,20 +667,30 @@ else:
             or ratio <= 0
         ):
             scaling = float("nan")
-            notional_leg1 = float("nan")
-            notional_leg2 = float("nan")
         else:
             scaling = target_daily_vol / pnl_combined_vol
-            notional_leg1 = scaling * 10_000.0
-            notional_leg2 = notional_leg1 * ratio
+
+        if target_daily_vol <= 0 or np.isnan(dv01_leg1_cents) or dv01_leg1_cents <= 0:
+            notional_leg1 = float("nan")
+        else:
+            notional_leg1 = (target_daily_vol * 10_000.0) / dv01_leg1_cents
+
+        if (
+            np.isnan(notional_leg1)
+            or np.isnan(dv01_leg2_cents)
+            or dv01_leg2_cents <= 0
+        ):
+            notional_leg2 = float("nan")
+        else:
+            notional_leg2 = notional_leg1 * (dv01_leg1_cents / dv01_leg2_cents)
 
         if np.isnan(spread_vol_bp):
             leg1_vol_cents = float("nan")
             leg2_vol_cents = float("nan")
             leg1_window_vol_cents = float("nan")
         else:
-            leg1_vol_cents = spread_vol_bp * dv01_leg1
-            leg2_vol_cents = spread_vol_bp * dv01_leg2
+            leg1_vol_cents = spread_vol_bp * dv01_leg1_cents
+            leg2_vol_cents = spread_vol_bp * dv01_leg2_cents
             leg1_window_vol_cents = leg1_vol_cents * np.sqrt(float(roll_vol))
 
         leg1_carry = leg_carry_roll(
@@ -582,11 +751,14 @@ else:
             scaled_trade_vol = (
                 pnl_combined_vol * scaling if not np.isnan(scaling) else pnl_combined_vol
             )
-            st.metric("Trade Daily P&L Vol (EUR)", f"{scaled_trade_vol:,.0f}")
+            st.metric("Trade Daily P&L Vol (EUR)", format_compact(scaled_trade_vol, unit="€"))
 
     leg_metric_cols = st.columns(6, gap="large")
     with leg_metric_cols[0]:
-        st.metric("Leg 1 DV01 (EUR/bp)", f"{dv01_leg1:,.2f}")
+        if np.isnan(dv01_leg1_cents):
+            st.metric("Leg 1 DV01 (cents/bp)", "n/a")
+        else:
+            st.metric("Leg 1 DV01 (cents/bp)", f"{dv01_leg1_cents:,.2f}")
     with leg_metric_cols[1]:
         if np.isnan(leg1_vol_cents):
             st.metric("Leg 1 Daily P&L Vol (cents)", "n/a")
@@ -596,9 +768,15 @@ else:
         if np.isnan(notional_leg1):
             st.metric("Leg 1 Notional Needed (EUR)", "n/a")
         else:
-            st.metric("Leg 1 Notional Needed (EUR)", f"{abs(notional_leg1):,.0f}")
+            st.metric(
+                "Leg 1 Notional Needed (EUR)",
+                format_compact(abs(notional_leg1), unit="€"),
+            )
     with leg_metric_cols[3]:
-        st.metric("Leg 2 DV01 (EUR/bp)", f"{dv01_leg2:,.2f}")
+        if np.isnan(dv01_leg2_cents):
+            st.metric("Leg 2 DV01 (cents/bp)", "n/a")
+        else:
+            st.metric("Leg 2 DV01 (cents/bp)", f"{dv01_leg2_cents:,.2f}")
     with leg_metric_cols[4]:
         if np.isnan(leg2_vol_cents):
             st.metric("Leg 2 Daily P&L Vol (cents)", "n/a")
@@ -608,7 +786,10 @@ else:
         if np.isnan(notional_leg2):
             st.metric("Leg 2 Notional Needed (EUR)", "n/a")
         else:
-            st.metric("Leg 2 Notional Needed (EUR)", f"{abs(notional_leg2):,.0f}")
+            st.metric(
+                "Leg 2 Notional Needed (EUR)",
+                format_compact(abs(notional_leg2), unit="€"),
+            )
 
     carry_cols = st.columns(5, gap="large")
     st.markdown(
@@ -631,14 +812,115 @@ else:
             st.metric("Trade Carry+Roll (cents)", f"{trade_carry_cents:,.2f}")
     with carry_cols[3]:
         if np.isnan(leg1_window_vol_cents):
-            st.metric("Leg 1 Window Vol (cents)", "n/a")
+            st.metric("Trade Window Vol (cents)", "n/a")
         else:
-            st.metric("Leg 1 Window Vol (cents)", f"{leg1_window_vol_cents:,.2f}")
+            st.metric("Trade Window Vol (cents)", f"{leg1_window_vol_cents:,.2f}")
     with carry_cols[4]:
         if np.isnan(carry_ratio_pct):
-            st.metric("Carry / Vol Ratio (%)", "n/a")
+            st.metric("Trade Carry/Vol Ratio (%)", "n/a")
         else:
-            st.metric("Carry / Vol Ratio (%)", f"{carry_ratio_pct:,.2f}%")
+            st.metric("Trade Carry/Vol Ratio (%)", f"{carry_ratio_pct:,.2f}%")
+
+    st.subheader("Carry-to-Vol Ratio vs Horizon")
+    if np.isnan(trade_carry_cents) or np.isnan(ratio) or dv01_leg1 <= 0 or dv01_leg2 <= 0:
+        st.info("Carry and volatility metrics required to compute horizon ratios.")
+    else:
+        horizons = [20, 60, 120, 252]
+        ratio_points: list[dict[str, float]] = []
+        series_for_vol = spread_returns_bps(spread) if spread is not None else pd.Series(dtype="float64")
+        series_for_vol = series_for_vol.dropna()
+
+        for horizon in horizons:
+            if horizon <= 0 or series_for_vol.size < horizon:
+                continue
+
+            leg1_carry_h = leg_carry_roll(
+                coupon_pct=coupon_leg1,
+                repo_pct=repo_leg1,
+                roll_down_bps=roll_down_leg1,
+                gross_price=price_leg1,
+                dv01_eur_bp=dv01_leg1,
+                window_days=int(horizon),
+            )
+            leg2_carry_h = leg_carry_roll(
+                coupon_pct=coupon_leg2,
+                repo_pct=repo_leg2,
+                roll_down_bps=roll_down_leg2,
+                gross_price=price_leg2,
+                dv01_eur_bp=dv01_leg2,
+                window_days=int(horizon),
+            )
+
+            trade_carry_h = leg1_carry_h.total_cents - (leg2_carry_h.total_cents * ratio)
+
+            horizon_vol_bp = series_for_vol.rolling(int(horizon)).std(ddof=1).iloc[-1]
+            if pd.isna(horizon_vol_bp) or horizon_vol_bp <= 0:
+                continue
+
+            leg1_daily_vol_cents = horizon_vol_bp * dv01_leg1_cents
+            leg1_window_vol_cents = leg1_daily_vol_cents * np.sqrt(float(horizon))
+
+            if leg1_window_vol_cents > 0 and not np.isnan(trade_carry_h):
+                ratio_points.append(
+                    {
+                        "horizon": horizon,
+                        "ratio": (trade_carry_h / leg1_window_vol_cents) * 100.0,
+                    }
+                )
+
+        ratio_df = pd.DataFrame(ratio_points).dropna(subset=["ratio"])
+
+        if ratio_df.empty:
+            st.info("No valid carry-to-vol ratios for the selected horizons.")
+        else:
+            ratio_chart = (
+                alt.Chart(ratio_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("horizon:Q", title="Horizon (trading days)"),
+                    y=alt.Y("ratio:Q", title="Carry / Expected Vol"),
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(ratio_chart, use_container_width=True)
+
+st.subheader("Bond Duration & DV01")
+duration_rows = []
+
+duration_keys = [
+    (st.session_state.file1_name or "Leg 1", "Leg 1"),
+    (st.session_state.file2_name or "Leg 2", "Leg 2"),
+]
+
+for display_name, key in duration_keys:
+    info = duration_summary.get(key, {}) if duration_summary else {}
+    duration_rows.append(
+        {
+            "Leg": display_name,
+            "Yield (%)": info.get("yield_pct", float("nan")),
+            "Macaulay Duration (yrs)": info.get("macaulay", float("nan")),
+            "Modified Duration (yrs)": info.get("modified", float("nan")),
+            "DV01 (cents)": info.get("dv01_cents", float("nan")),
+        }
+    )
+
+duration_df = pd.DataFrame(duration_rows)
+numeric_cols = [
+    "Yield (%)",
+    "Macaulay Duration (yrs)",
+    "Modified Duration (yrs)",
+    "DV01 (cents)",
+]
+
+if duration_df[numeric_cols].isna().all().all():
+    st.info("Duration metrics unavailable for the current inputs.")
+else:
+    display_df = duration_df.copy()
+    for col in numeric_cols:
+        display_df[col] = display_df[col].apply(
+            lambda x: "n/a" if pd.isna(x) else f"{x:,.4f}" if col == "Yield (%)" else f"{x:,.2f}"
+        )
+    st.table(display_df.set_index("Leg"))
 
 # Optional downloads
 st.markdown("---")
