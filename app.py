@@ -323,15 +323,14 @@ with st.sidebar:
         "Settlement Date",
         value=default_settlement_ts.date(),
     )
-    coupon_frequency = st.selectbox(
-        "Coupon Frequency",
-        ["Annual", "Semi-Annual"],
-        index=0,
-    )
-
     st.markdown("**Leg Inputs**")
     col_leg1, col_leg2 = st.columns(2, gap="small")
     with col_leg1:
+        coupon_frequency_leg1 = st.selectbox(
+            "CPN Freq Leg 1",
+            ["Annual", "Semi-Annual"],
+            index=0,
+        )
         coupon_leg1 = st.number_input(
             "Coupon Leg 1 (%)",
             value=4.0,
@@ -362,6 +361,11 @@ with st.sidebar:
             value=default_maturity_ts.date(),
         )
     with col_leg2:
+        coupon_frequency_leg2 = st.selectbox(
+            "CPN Freq Leg 2",
+            ["Annual", "Semi-Annual"],
+            index=0,
+        )
         coupon_leg2 = st.number_input(
             "Coupon Leg 2 (%)",
             value=3.5,
@@ -521,7 +525,6 @@ else:
     )
     render_line_chart(corr_chart, height=260, y_label="Correlation", dropna=False)
 
-freq_value = 1 if coupon_frequency == "Annual" else 2
 settlement_ts = pd.Timestamp(settlement_date)
 
 yield_leg1 = normalize_yield(last_valid_value(s1))
@@ -531,7 +534,7 @@ macaulay_leg1, modified_leg1, dv01_leg1_cents = compute_duration_metrics(
     yield_rate=yield_leg1,
     coupon_pct=coupon_leg1,
     price=price_leg1,
-    frequency=freq_value,
+    frequency=1 if coupon_frequency_leg1 == "Annual" else 2,
     settlement=settlement_ts,
     maturity=pd.Timestamp(maturity_leg1),
 )
@@ -540,7 +543,7 @@ macaulay_leg2, modified_leg2, dv01_leg2_cents = compute_duration_metrics(
     yield_rate=yield_leg2,
     coupon_pct=coupon_leg2,
     price=price_leg2,
-    frequency=freq_value,
+    frequency=1 if coupon_frequency_leg2 == "Annual" else 2,
     settlement=settlement_ts,
     maturity=pd.Timestamp(maturity_leg2),
 )
