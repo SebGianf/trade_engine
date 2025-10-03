@@ -230,6 +230,73 @@ def format_compact(value: float | None, *, decimals: int = 2, unit: str = "") ->
     return f"{sign}{unit}{abs_val:,.{decimals}f}"
 
 
+def compute_price_from_yield(
+    *,
+    yield_rate: float,
+    coupon_pct: float,
+    frequency: int,
+    settlement: pd.Timestamp,
+    maturity: pd.Timestamp,
+    day_count: float = 365.25,
+) -> float:
+    if (
+        pd.isna(yield_rate)
+        or pd.isna(coupon_pct)
+        or frequency <= 0
+    ):
+        return float("nan")
+
+    settlement = pd.Timestamp(settlement)
+    maturity = pd.Timestamp(maturity)
+    if settlement >= maturity:
+        return float("nan")
+
+    coupon_rate = float(coupon_pct) / 100.0
+    freq = int(frequency)
+    y = float(yield_rate)
+
+    step_months = 12 // freq
+    if step_months <= 0:
+        return float("nan")
+
+    coupon_dates: list[pd.Timestamp] = []
+    current = maturity
+    while current > settlement:
+        coupon_dates.append(current)
+        current -= DateOffset(months=step_months)
+
+    if not coupon_dates:
+        return float("nan")
+
+    coupon_dates.sort()
+    times = np.array([(date - settlement).days / day_count for date in coupon_dates], dtype=float)
+    if times.size == 0:
+        return float("nan")
+
+    if (1 + y / freq) <= 0:
+        return float("nan")
+
+    coupon_payment = coupon_rate / freq * 100.0
+    cashflows = np.full(times.shape, coupon_payment)
+    cashflows[-1] += 100.0
+
+    discounts = (1 + y / freq) ** (freq * times)
+    pv = cashflows / discounts
+    return float(pv.sum())
+
+
+def last_numeric_value(df: pd.DataFrame | None) -> float:
+    if df is None or df.empty:
+        return float("nan")
+    numerics = df.select_dtypes(include=[np.number])
+    if numerics.empty:
+        return float("nan")
+    series = numerics.iloc[:, -1].dropna()
+    if series.empty:
+        return float("nan")
+    return float(series.iloc[-1])
+
+
 def compute_duration_metrics(
     *,
     yield_rate: float,
@@ -673,20 +740,6 @@ else:
         else:
             scaling = target_daily_vol / pnl_combined_vol
 
-        if target_daily_vol <= 0 or np.isnan(dv01_leg1_cents) or dv01_leg1_cents <= 0:
-            notional_leg1 = float("nan")
-        else:
-            notional_leg1 = (target_daily_vol * 10_000.0) / dv01_leg1_cents
-
-        if (
-            np.isnan(notional_leg1)
-            or np.isnan(dv01_leg2_cents)
-            or dv01_leg2_cents <= 0
-        ):
-            notional_leg2 = float("nan")
-        else:
-            notional_leg2 = notional_leg1 * (dv01_leg1_cents / dv01_leg2_cents)
-
         if np.isnan(spread_vol_bp):
             leg1_vol_cents = float("nan")
             leg2_vol_cents = float("nan")
@@ -695,6 +748,26 @@ else:
             leg1_vol_cents = spread_vol_bp * dv01_leg1_cents
             leg2_vol_cents = spread_vol_bp * dv01_leg2_cents
             leg1_window_vol_cents = leg1_vol_cents * np.sqrt(float(roll_vol))
+
+        if (
+            target_daily_vol <= 0
+            or np.isnan(leg1_vol_cents)
+            or leg1_vol_cents <= 0
+        ):
+            notional_leg1 = float("nan")
+        else:
+            notional_leg1 = (target_daily_vol * 10_000.0) / leg1_vol_cents
+
+        if (
+            np.isnan(notional_leg1)
+            or np.isnan(dv01_leg1_cents)
+            or np.isnan(dv01_leg2_cents)
+            or dv01_leg1_cents <= 0
+            or dv01_leg2_cents <= 0
+        ):
+            notional_leg2 = float("nan")
+        else:
+            notional_leg2 = notional_leg1 * (dv01_leg1_cents / dv01_leg2_cents)
 
         leg1_carry = leg_carry_roll(
             coupon_pct=coupon_leg1,
@@ -924,6 +997,54 @@ else:
             lambda x: "n/a" if pd.isna(x) else f"{x:,.4f}" if col == "Yield (%)" else f"{x:,.2f}"
         )
     st.table(display_df.set_index("Leg"))
+
+st.markdown("---")
+st.subheader("Latest Yield & Gross Price Snapshot")
+
+snapshot_rows = []
+for display_name, df in (
+    (st.session_state.file1_name or "Leg 1", st.session_state.get("df1")),
+    (st.session_state.file2_name or "Leg 2", st.session_state.get("df2")),
+):
+    last_yield_raw = last_numeric_value(df)
+    last_yield_norm = normalize_yield(last_yield_raw)
+    if display_name == (st.session_state.file1_name or "Leg 1"):
+        freq = 1 if coupon_frequency_leg1 == "Annual" else 2
+        coupon_pct = coupon_leg1
+        maturity_dt = pd.Timestamp(maturity_leg1)
+    else:
+        freq = 1 if coupon_frequency_leg2 == "Annual" else 2
+        coupon_pct = coupon_leg2
+        maturity_dt = pd.Timestamp(maturity_leg2)
+
+    last_price_calc = compute_price_from_yield(
+        yield_rate=last_yield_norm,
+        coupon_pct=coupon_pct,
+        frequency=freq,
+        settlement=pd.Timestamp(settlement_date),
+        maturity=maturity_dt,
+    )
+
+    snapshot_rows.append(
+        {
+            "Leg": display_name,
+            "Last Yield (%)": float("nan") if pd.isna(last_yield_norm) else last_yield_norm * 100.0,
+            "Last Gross Price": float("nan") if pd.isna(last_price_calc) else last_price_calc,
+        }
+    )
+
+snapshot_df = pd.DataFrame(snapshot_rows)
+if snapshot_df[["Last Yield (%)", "Last Gross Price"]].isna().all().all():
+    st.info("Latest yield and price snapshot unavailable.")
+else:
+    display_snapshot = snapshot_df.copy()
+    display_snapshot["Last Yield (%)"] = display_snapshot["Last Yield (%)"].apply(
+        lambda x: "n/a" if pd.isna(x) else f"{x:,.4f}"
+    )
+    display_snapshot["Last Gross Price"] = display_snapshot["Last Gross Price"].apply(
+        lambda x: "n/a" if pd.isna(x) else f"{x:,.2f}"
+    )
+    st.table(display_snapshot.set_index("Leg"))
 
 # Optional downloads
 st.markdown("---")
